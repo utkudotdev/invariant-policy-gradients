@@ -216,7 +216,7 @@ def report_kernel_memory(name, train_step_fn, args):
     """Compile the training kernel and print its XLA memory analysis."""
     ma = train_step_fn.lower(*args).compile().compiled.memory_analysis()
     print(
-        f"[{name}] temp={ma.temp_size_in_bytes / 1e6:.3f}MB  "
+        f"[{name}] temp={ma.temp_size_in_bytes} bytes  "
         f"output={ma.output_size_in_bytes / 1e6:.3f}MB  "
         f"args={ma.argument_size_in_bytes / 1e6:.3f}MB  "
         f"code={ma.generated_code_size_in_bytes / 1e6:.3f}MB"
