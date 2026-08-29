@@ -35,6 +35,7 @@ class TrainingParams:
 
 def rollout_joint(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     s0: State,
     r0: State,
     key: jaxtyping.Key,
@@ -43,18 +44,18 @@ def rollout_joint(
     env_params: EnvParams,
     T: int,
 ) -> Rollout[State, Control]:
-    obs0 = env.get_observation(s0, r0)
+    obs0 = encoding.encode(s0, r0)
 
     def step(obs_t, key_t):
         u_ref = env.sample_reference_action(key_t, env_params)
         u = policy(obs_t, u_ref)
-        next_obs = env.f_joint(obs_t, u, u_ref, dynamics_params, dt)
+        next_obs = encoding.step(obs_t, u, u_ref, dynamics_params, dt)
         return next_obs, (next_obs, u, u_ref)
 
     keys = jax.random.split(key, T)
     _, (observations, us, us_ref) = jax.lax.scan(step, obs0, keys)
 
-    states, ref_states = jax.vmap(env.lift_observation)(
+    states, ref_states = jax.vmap(encoding.lift)(
         jnp.concatenate([jnp.expand_dims(obs0, axis=0), observations])
     )
 
@@ -68,6 +69,7 @@ def rollout_joint(
 
 def rollout_eval(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     s0: State,
     r0: State,
     key: jaxtyping.Key,
@@ -80,7 +82,7 @@ def rollout_eval(
         state, ref_state = carry
 
         u_ref = env.sample_reference_action(key_t, env_params)
-        obs = env.get_observation(state, ref_state)
+        obs = encoding.encode(state, ref_state)
         u = policy(obs, u_ref)
 
         next_state = env.f(state, u, dynamics_params, dt)
@@ -100,6 +102,7 @@ def rollout_eval(
 
 def batched_loss(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     key: jaxtyping.Key,
     dynamics_params: DynamicsParams,
     dt: float,
@@ -116,6 +119,7 @@ def batched_loss(
     def one(s0, r0, key):
         out = rollout_joint(
             policy,
+            encoding,
             s0,
             r0,
             key,
@@ -133,6 +137,7 @@ def batched_loss(
 @eqx.filter_jit
 def train_step(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     opt_state: optax.OptState,
     optim,
     key: jaxtyping.Key,
@@ -142,7 +147,7 @@ def train_step(
     train_params: TrainingParams,
 ):
     loss, grads = eqx.filter_value_and_grad(batched_loss)(
-        policy, key, dynamics_params, dt, env_params, train_params
+        policy, encoding, key, dynamics_params, dt, env_params, train_params
     )
     updates, opt_state = optim.update(grads, opt_state, policy)
     policy = eqx.apply_updates(policy, updates)
@@ -151,6 +156,7 @@ def train_step(
 
 def train(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     key: jaxtyping.Key,
     dynamics_params: DynamicsParams,
     dt: float,
@@ -165,6 +171,7 @@ def train(
         key, step_key = jax.random.split(key)
         policy, opt_state, loss = train_step(
             policy,
+            encoding,
             opt_state,
             optim,
             step_key,
@@ -182,6 +189,7 @@ def train(
 
 def evaluate(
     policy: Policy,
+    encoding: env.ObservationEncoding,
     key: jaxtyping.Key,
     dynamics_params: DynamicsParams,
     dt: float,
@@ -192,11 +200,13 @@ def evaluate(
     s0, r0 = env.sample_initial_states(sample_key, 1, env_params)
     s0, r0 = batched_pytree_get_first(s0), batched_pytree_get_first(r0)
 
-    return rollout_eval(policy, s0, r0, rollout_key, dynamics_params, dt, env_params, T)
+    return rollout_eval(
+        policy, encoding, s0, r0, rollout_key, dynamics_params, dt, env_params, T
+    )
 
 
 class MLPPolicy(eqx.Module):
-    """Baseline (unreduced) policy: sees the full state pair plus the reference action.
+    """Policy over whichever observation encoding it is given, plus the reference action.
 
     The output is squashed through the Astrobee actuation limits; without a bound
     the untrained policy drives ||omega|| high enough that the explicit Euler step
@@ -206,9 +216,9 @@ class MLPPolicy(eqx.Module):
     mlp: eqx.nn.MLP
     limits: jax.Array
 
-    def __init__(self, key, width=64, depth=2):
+    def __init__(self, key, encoding: env.ObservationEncoding, width=64, depth=2):
         self.mlp = eqx.nn.MLP(
-            in_size=env.OBS_DIM + env.CONTROL_DIM,
+            in_size=encoding.dim + env.CONTROL_DIM,
             out_size=env.CONTROL_DIM,
             width_size=width,
             depth=depth,
@@ -254,57 +264,77 @@ def main():
         batch=64,
         lr=1e-3,
     )
-    policy = MLPPolicy(init_key)
+
+    encodings = [env.FULL_OBSERVATION, env.REDUCED_OBSERVATION]
+    # Same initial weights where the shapes allow, so the curves differ only by
+    # what the policy is allowed to observe.
+    policies = {e.name: MLPPolicy(init_key, e) for e in encodings}
 
     temp_optim = optax.adam(1e-3)
-    temp_optim_state = temp_optim.init(eqx.filter(policy, eqx.is_array))
-    report_kernel_memory(
-        "astrobee (full state)",
-        train_step,
-        (
-            policy,
-            temp_optim_state,
-            temp_optim,
+    for encoding in encodings:
+        policy = policies[encoding.name]
+        report_kernel_memory(
+            encoding.name,
+            train_step,
+            (
+                policy,
+                encoding,
+                temp_optim.init(eqx.filter(policy, eqx.is_array)),
+                temp_optim,
+                train_key,
+                dynamics_params,
+                dt,
+                env_params,
+                train_params,
+            ),
+        )
+
+    curves = {}
+    rollouts = {}
+    for encoding in encodings:
+        print(f"\n=== training: {encoding.name} (obs dim {encoding.dim}) ===")
+        trained, losses = train(
+            policies[encoding.name],
+            encoding,
             train_key,
             dynamics_params,
             dt,
             env_params,
             train_params,
-        ),
-    )
+        )
+        curves[encoding.name] = losses
+        out = evaluate(
+            trained, encoding, eval_key, dynamics_params, dt, env_params, train_params.T
+        )
+        rollouts[encoding.name] = out
 
-    trained, losses = train(
-        policy,
-        train_key,
-        dynamics_params,
-        dt,
-        env_params,
-        train_params,
-    )
-    out = evaluate(trained, eval_key, dynamics_params, dt, env_params, T=train_params.T)
-    pos_err = env.tracking_error(out)
-    att_err = env.attitude_error(out)
-    print(
-        f"eval: initial pos error = {pos_err[0]:.3f} m, final = {pos_err[-1]:.3f} m, "
-        f"mean = {pos_err.mean():.3f} m"
-    )
-    print(
-        f"eval: initial att error = {att_err[0]:.3f} rad, final = {att_err[-1]:.3f} rad, "
-        f"mean = {att_err.mean():.3f} rad"
-    )
+        pos_err = env.tracking_error(out)
+        att_err = env.attitude_error(out)
+        print(
+            f"eval: pos error  initial {pos_err[0]:.3f} m, "
+            f"final {pos_err[-1]:.3f} m, mean {pos_err.mean():.3f} m"
+        )
+        print(
+            f"eval: att error  initial {att_err[0]:.3f} rad, "
+            f"final {att_err[-1]:.3f} rad, mean {att_err.mean():.3f} rad"
+        )
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(losses, color="tab:gray", lw=1)
+    for (name, losses), color in zip(curves.items(), ["tab:gray", "tab:purple"]):
+        ax.plot(losses, color=color, lw=1, label=name)
     ax.set_xlabel("training iteration")
     ax.set_ylabel("mean tracking cost")
-    ax.set_title("astrobee policy-gradient training (full-state observation)")
+    ax.set_title("astrobee policy-gradient training: baseline vs SE(3) reduction")
+    ax.legend()
     fig.tight_layout()
     fig.savefig("training_curve_astrobee.png", dpi=120)
     print("saved plot to training_curve_astrobee.png")
 
-    env.save_trajectory_gif(
-        out, dt, "trajectory_astrobee.gif", title="astrobee tracking"
-    )
+    for name, path in [
+        (env.FULL_OBSERVATION.name, "trajectory_astrobee_full.gif"),
+        (env.REDUCED_OBSERVATION.name, "trajectory_astrobee_reduced.gif"),
+    ]:
+        env.save_trajectory_gif(rollouts[name], dt, path, title=f"astrobee: {name}")
 
 
 if __name__ == "__main__":
