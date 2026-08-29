@@ -15,7 +15,7 @@ from environments import (
     batched_pytree_get_first,
     batched_pytree_prepend,
 )
-from environments import particle as env
+from environments import astrobee as env
 
 State = env.State
 Control = env.Control
@@ -195,10 +195,18 @@ def evaluate(
     return rollout_eval(policy, s0, r0, rollout_key, dynamics_params, dt, env_params, T)
 
 
-class ReducedPolicy(eqx.Module):
-    mlp: eqx.nn.MLP
+class MLPPolicy(eqx.Module):
+    """Baseline (unreduced) policy: sees the full state pair plus the reference action.
 
-    def __init__(self, key, width=32, depth=2):
+    The output is squashed through the Astrobee actuation limits; without a bound
+    the untrained policy drives ||omega|| high enough that the explicit Euler step
+    on the Euler equations diverges mid-rollout.
+    """
+
+    mlp: eqx.nn.MLP
+    limits: jax.Array
+
+    def __init__(self, key, width=64, depth=2):
         self.mlp = eqx.nn.MLP(
             in_size=env.OBS_DIM + env.CONTROL_DIM,
             out_size=env.CONTROL_DIM,
@@ -206,10 +214,11 @@ class ReducedPolicy(eqx.Module):
             depth=depth,
             key=key,
         )
+        self.limits = env.wrench_limits()
 
     def __call__(self, state_obs: Observation, u_ref: Control):
         obs = jnp.concatenate([state_obs, u_ref])
-        return self.mlp(obs)
+        return self.limits * jnp.tanh(self.mlp(obs))
 
 
 def report_kernel_memory(name, train_step_fn, args):
@@ -228,12 +237,15 @@ def main():
     key = jax.random.key(0)
     init_key, train_key, eval_key = jax.random.split(key, 3)
 
-    dynamics_params = env.DynamicsParams(m=1.0)
+    dynamics_params = env.default_dynamics_params()
     env_params = env.EnvParams(
-        cost_coeffs=env.CostCoeffs(c_r=1.0, a_r=5.0, c_v=0.5, c_u=0.1),
-        sigma=2.0,
-        pos_std=1.0,
-        vel_std=0.5,
+        cost_coeffs=env.CostCoeffs(c_r=1.0, a_r=5.0, c_R=1.0, c_xi=0.5, c_u=0.1),
+        sigma_torque=0.03,
+        sigma_force=0.3,
+        pos_std=0.5,
+        att_std=0.3,
+        vel_std=0.1,
+        omega_std=0.1,
     )
     dt = 0.05
     train_params = TrainingParams(
@@ -242,12 +254,12 @@ def main():
         batch=64,
         lr=1e-3,
     )
-    policy = ReducedPolicy(init_key)
+    policy = MLPPolicy(init_key)
 
     temp_optim = optax.adam(1e-3)
     temp_optim_state = temp_optim.init(eqx.filter(policy, eqx.is_array))
     report_kernel_memory(
-        "reduced dynamics",
+        "astrobee (full state)",
         train_step,
         (
             policy,
@@ -271,24 +283,27 @@ def main():
     )
     out = evaluate(trained, eval_key, dynamics_params, dt, env_params, T=train_params.T)
     pos_err = env.tracking_error(out)
+    att_err = env.attitude_error(out)
     print(
-        f"eval: initial pos error = {pos_err[0]:.3f}, final = {pos_err[-1]:.3f}, "
-        f"mean = {pos_err.mean():.3f}"
+        f"eval: initial pos error = {pos_err[0]:.3f} m, final = {pos_err[-1]:.3f} m, "
+        f"mean = {pos_err.mean():.3f} m"
+    )
+    print(
+        f"eval: initial att error = {att_err[0]:.3f} rad, final = {att_err[-1]:.3f} rad, "
+        f"mean = {att_err.mean():.3f} rad"
     )
 
-    # Comparison of training curves.
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(losses, color="tab:gray", lw=1, label="reduced")
+    ax.plot(losses, color="tab:gray", lw=1)
     ax.set_xlabel("training iteration")
     ax.set_ylabel("mean tracking cost")
-    ax.set_title("policy-gradient training: full-state vs reduced observation")
-    ax.legend()
+    ax.set_title("astrobee policy-gradient training (full-state observation)")
     fig.tight_layout()
-    fig.savefig("training_curve_custom.png", dpi=120)
-    print("saved plot to training_curve.png")
+    fig.savefig("training_curve_astrobee.png", dpi=120)
+    print("saved plot to training_curve_astrobee.png")
 
     env.save_trajectory_gif(
-        out, dt, "trajectory_reduced_custom.gif", title="reduced tracking"
+        out, dt, "trajectory_astrobee.gif", title="astrobee tracking"
     )
 
 
