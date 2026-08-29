@@ -1,14 +1,9 @@
 """Astrobee environment (arXiv:2409.11238, Example 2).
 
 State is (q, xi) in SE(3) x R^6: the pose q (a `jaxlie.SE3`) and the *body-frame*
-twist xi = (omega, v). The control is the applied wrench u = (mu, f) in R^6.
-
-Two observation encodings are provided, in both cases with the reference action
-u^d fed to the policy separately:
-
-  * `FULL_OBSERVATION` -- the paper's baseline, which sees (x, x^d) whole.
-  * `REDUCED_OBSERVATION` -- the SE(3) quotient of eq. (55), which sees only
-    p(s) = (q^-1 q^d, xi, xi^d).
+twist xi = (omega, v). The control is the applied wrench u = (mu, f) in R^6. The
+observation is the SE(3) quotient of eq. (55), p(s) = (q^-1 q^d, xi, xi^d), with
+the reference action u^d fed to the policy separately.
 
 Paper dynamics (52):
 
@@ -24,7 +19,6 @@ Newton's law reads m (vdot + omega x v) = f, so the correct update is
 which is what is implemented below, mirroring the omega x J omega term in (52c).
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass
 
 import jax
@@ -151,10 +145,12 @@ def sample_reference_action(key: jaxtyping.Key, params: EnvParams) -> Control:
     return jnp.clip(scale * jax.random.normal(key, (CONTROL_DIM,)), -limits, limits)
 
 
-# --- observations ----------------------------------------------------------
+# --- observation (SE(3) quotient) ------------------------------------------
 
-Observation = Float[jax.Array, " obs_dim"]
-"""A flat encoding of the state pair; see `FULL_OBSERVATION` / `REDUCED_OBSERVATION`."""
+Observation = Float[jax.Array, "24"]
+"""Reduced observation p(s) = (q^-1 q^d, xi, xi^d) (paper eq. 55)."""
+
+OBS_DIM = 24
 
 
 def _flatten_pose(q: jaxlie.SE3) -> Float[jax.Array, "12"]:
@@ -172,36 +168,8 @@ def _unflatten_pose(flat: Float[jax.Array, "12"]) -> jaxlie.SE3:
     )
 
 
-FULL_OBS_DIM = 36
-
-
-def get_full_observation(state: State, state_ref: State) -> Observation:
-    """Baseline observation: the actual and reference states, seen whole."""
-    return jnp.concatenate(
-        [
-            _flatten_pose(state.q),
-            state.omega,
-            state.v,
-            _flatten_pose(state_ref.q),
-            state_ref.omega,
-            state_ref.v,
-        ]
-    )
-
-
-def lift_full_observation(obs: Observation) -> tuple[State, State]:
-    """Inverse of `get_full_observation` (exact, since nothing is reduced away)."""
-    return (
-        State(q=_unflatten_pose(obs[:12]), omega=obs[12:15], v=obs[15:18]),
-        State(q=_unflatten_pose(obs[18:30]), omega=obs[30:33], v=obs[33:36]),
-    )
-
-
-REDUCED_OBS_DIM = 24
-
-
-def get_reduced_observation(state: State, state_ref: State) -> Observation:
-    """Reduced observation p(s) = (q^-1 q^d, xi, xi^d) (paper eq. 55).
+def get_observation(state: State, state_ref: State) -> Observation:
+    """Reduce a state pair to p(s) = (q^-1 q^d, xi, xi^d) (paper eq. 55).
 
     The symmetry group is K = SE(3) acting on the left, Psi_k(q, xi) = (kq, xi),
     with H = {1} acting trivially on the wrench; Theorem 3 with lambda(s) = q
@@ -221,7 +189,7 @@ def get_reduced_observation(state: State, state_ref: State) -> Observation:
     )
 
 
-def lift_reduced_observation(obs: Observation) -> tuple[State, State]:
+def lift_observation(obs: Observation) -> tuple[State, State]:
     """A representative of the orbit p^-1(s~), taken on the section q = identity.
 
     This is the choice the paper makes in eq. (30a)/(46) to define the reduced
@@ -234,49 +202,17 @@ def lift_reduced_observation(obs: Observation) -> tuple[State, State]:
     )
 
 
-def make_f_joint(lift, encode):
-    """Step the actual and reference states together in observation space.
+def f_joint(
+    obs: Observation, u: Control, u_ref: Control, params: DynamicsParams, dt: float
+) -> Observation:
+    """Step the quotient MDP forward one step.
 
-    With the reduced encoding this is exactly the quotient transition: lifting to
-    q = identity and re-encoding turns `q -> q exp(xi^ dt)` into
-    `q_err -> exp(xi^ dt)^-1 q_err exp(xi^d^ dt)`.
+    Lifting to q = identity and re-encoding turns `q -> q exp(xi^ dt)` into
+    `q_err -> exp(xi^ dt)^-1 q_err exp(xi^d^ dt)`, so the reduced transition
+    falls out of the encode/lift pair rather than needing to be derived by hand.
     """
-
-    def f_joint(
-        obs: Observation, u: Control, u_ref: Control, params: DynamicsParams, dt: float
-    ) -> Observation:
-        state, state_ref = lift(obs)
-        return encode(f(state, u, params, dt), f(state_ref, u_ref, params, dt))
-
-    return f_joint
-
-
-@dataclass(frozen=True)
-class ObservationEncoding:
-    """What a policy is allowed to see, and how to roll it forward."""
-
-    name: str
-    dim: int
-    encode: Callable[[State, State], Observation]
-    lift: Callable[[Observation], tuple[State, State]]
-    step: Callable[..., Observation]
-
-
-FULL_OBSERVATION = ObservationEncoding(
-    name="full-state (baseline)",
-    dim=FULL_OBS_DIM,
-    encode=get_full_observation,
-    lift=lift_full_observation,
-    step=make_f_joint(lift_full_observation, get_full_observation),
-)
-
-REDUCED_OBSERVATION = ObservationEncoding(
-    name="reduced (SE(3) quotient)",
-    dim=REDUCED_OBS_DIM,
-    encode=get_reduced_observation,
-    lift=lift_reduced_observation,
-    step=make_f_joint(lift_reduced_observation, get_reduced_observation),
-)
+    state, state_ref = lift_observation(obs)
+    return get_observation(f(state, u, params, dt), f(state_ref, u_ref, params, dt))
 
 
 # --- initial states --------------------------------------------------------
