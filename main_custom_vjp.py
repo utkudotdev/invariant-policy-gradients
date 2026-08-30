@@ -19,6 +19,7 @@ from environments import astrobee as env
 
 State = env.State
 Control = env.Control
+ReducedState = env.ReducedState
 Observation = env.Observation
 DynamicsParams = env.DynamicsParams
 EnvParams = env.EnvParams
@@ -43,19 +44,19 @@ def rollout_joint(
     env_params: EnvParams,
     T: int,
 ) -> Rollout[State, Control]:
-    obs0 = env.get_observation(s0, r0)
+    reduced0 = env.get_reduced_state(s0, r0)
 
-    def step(obs_t, key_t):
+    def step(reduced_t, key_t):
         u_ref = env.sample_reference_action(key_t, env_params)
-        u = policy(obs_t, u_ref)
-        next_obs = env.f_joint(obs_t, u, u_ref, dynamics_params, dt)
-        return next_obs, (next_obs, u, u_ref)
+        u = policy(env.get_observation(reduced_t), u_ref)
+        next_reduced = env.f_joint(reduced_t, u, u_ref, dynamics_params, dt)
+        return next_reduced, (next_reduced, u, u_ref)
 
     keys = jax.random.split(key, T)
-    _, (observations, us, us_ref) = jax.lax.scan(step, obs0, keys)
+    _, (reduced_states, us, us_ref) = jax.lax.scan(step, reduced0, keys)
 
-    states, ref_states = jax.vmap(env.lift_observation)(
-        jnp.concatenate([jnp.expand_dims(obs0, axis=0), observations])
+    states, ref_states = jax.vmap(env.lift_reduced_state)(
+        jnp.concatenate([jnp.expand_dims(reduced0, axis=0), reduced_states])
     )
 
     return Rollout(
@@ -80,7 +81,7 @@ def rollout_eval(
         state, ref_state = carry
 
         u_ref = env.sample_reference_action(key_t, env_params)
-        obs = env.get_observation(state, ref_state)
+        obs = env.get_observation(env.get_reduced_state(state, ref_state))
         u = policy(obs, u_ref)
 
         next_state = env.f(state, u, dynamics_params, dt)
@@ -196,7 +197,8 @@ def evaluate(
 
 
 class MLPPolicy(eqx.Module):
-    """Policy on the reduced observation p(s), plus the reference action.
+    """Policy on the observation (`env.get_observation` of the reduced state
+    p(s)), plus the reference action.
 
     The output is squashed through the Astrobee actuation limits; without a bound
     the untrained policy drives ||omega|| high enough that the explicit Euler step
@@ -214,7 +216,7 @@ class MLPPolicy(eqx.Module):
             depth=depth,
             key=key,
         )
-        self.limits = env.wrench_limits()
+        self.limits = env.control_limits()
 
     def __call__(self, state_obs: Observation, u_ref: Control):
         obs = jnp.concatenate([state_obs, u_ref])

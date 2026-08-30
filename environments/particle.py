@@ -1,7 +1,8 @@
 """Point-particle environment (arXiv:2409.11238, "Particle").
 
 State is (r, v) in R^2 x R^2; the control is a force in R^2; the reduced
-observation is the state error (r - r^d, v - v^d).
+state is the state error (r - r^d, v - v^d), which the policy also sees
+verbatim as its observation.
 """
 
 from dataclasses import dataclass
@@ -31,9 +32,15 @@ class DynamicsParams:
 
 Control = Float[jax.Array, "2"]
 
+ReducedState = Float[jax.Array, "4"]
+"""Reduced state (r - r^d, v - v^d) (paper eq. 44)."""
+
 Observation = Float[jax.Array, "4"]
+"""What the policy network is fed. Identical to the reduced state here."""
 
 CONTROL_DIM = 2
+
+REDUCED_DIM = 4
 
 OBS_DIM = 4
 
@@ -80,33 +87,54 @@ def sample_reference_action(key: jaxtyping.Key, params: EnvParams) -> Control:
     return params.sigma * jax.random.normal(key, (CONTROL_DIM,))
 
 
-def get_observation(state: State, state_ref: State) -> Observation:
+def get_reduced_state(state: State, state_ref: State) -> ReducedState:
     return jnp.concatenate([state.r - state_ref.r, state.v - state_ref.v])
 
 
-def lift_observation(obs: Observation) -> tuple[State, State]:
-    return State(r=obs[:2], v=obs[2:]), State(r=jnp.zeros(2), v=jnp.zeros(2))
+def get_observation(reduced: ReducedState) -> Observation:
+    """Map the reduced state to the network's input representation.
+
+    The reduced state is already a plain error vector in R^4, with nothing like
+    the SE(3) pose of the Astrobee to re-parameterize, so this is the identity.
+    It exists so every environment presents the same interface to the training
+    loop.
+    """
+    return reduced
+
+
+def lift_reduced_state(reduced: ReducedState) -> tuple[State, State]:
+    return State(r=reduced[:2], v=reduced[2:]), State(
+        r=jnp.zeros(2), v=jnp.zeros(2)
+    )
 
 
 # TODO: in theory i think we have linear output tangents so this could be done using custom_jvp and
 # letting jax handle the transposition, but I don't know if this will do what we expect in practice.
 @jax.custom_vjp
 def f_joint(
-    obs: Observation, u: Control, u_ref: Control, params: DynamicsParams, dt: float
-) -> Observation:
-    state, state_ref = lift_observation(obs)
+    reduced: ReducedState,
+    u: Control,
+    u_ref: Control,
+    params: DynamicsParams,
+    dt: float,
+) -> ReducedState:
+    state, state_ref = lift_reduced_state(reduced)
     new_state = f(state, u, params, dt)
     new_state_ref = f(state_ref, u_ref, params, dt)
-    return get_observation(new_state, new_state_ref)
+    return get_reduced_state(new_state, new_state_ref)
 
 
 def f_joint_fwd(
-    obs: Observation, u: Control, u_ref: Control, params: DynamicsParams, dt: float
+    reduced: ReducedState,
+    u: Control,
+    u_ref: Control,
+    params: DynamicsParams,
+    dt: float,
 ):
-    return f_joint(obs, u, u_ref, params, dt), (params, dt)
+    return f_joint(reduced, u, u_ref, params, dt), (params, dt)
 
 
-def f_joint_bwd(res: tuple[DynamicsParams, float], g: Observation):
+def f_joint_bwd(res: tuple[DynamicsParams, float], g: ReducedState):
     params, dt = res
     return (
         g,
