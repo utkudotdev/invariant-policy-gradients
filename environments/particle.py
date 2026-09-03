@@ -65,6 +65,11 @@ class EnvParams:
     vel_std: float
 
 
+def control_limits() -> Control:
+    # we don't actually
+    return jnp.array([10.0, 10.0])
+
+
 def f(state: State, u: Control, params: DynamicsParams, dt: float) -> State:
     """Discretized point-particle dynamics.
 
@@ -83,8 +88,13 @@ def sample_reference_action(key: jaxtyping.Key, params: EnvParams) -> Control:
 
     The paper (arXiv:2409.11238, eq. 10-11c) models the reference action
     distribution rho for the Particle as an isotropic Gaussian N(0, Sigma).
+    We also have control limits unlike the paper, which we found to be necessary
+    for some systems.
     """
-    return params.sigma * jax.random.normal(key, (CONTROL_DIM,))
+    limits = control_limits()
+    return jnp.clip(
+        params.sigma * jax.random.normal(key, (CONTROL_DIM,)), -limits, limits
+    )
 
 
 def get_reduced_state(state: State, state_ref: State) -> ReducedState:
@@ -103,9 +113,7 @@ def get_observation(reduced: ReducedState) -> Observation:
 
 
 def lift_reduced_state(reduced: ReducedState) -> tuple[State, State]:
-    return State(r=reduced[:2], v=reduced[2:]), State(
-        r=jnp.zeros(2), v=jnp.zeros(2)
-    )
+    return State(r=reduced[:2], v=reduced[2:]), State(r=jnp.zeros(2), v=jnp.zeros(2))
 
 
 # TODO: in theory i think we have linear output tangents so this could be done using custom_jvp and
@@ -137,14 +145,9 @@ def f_joint_fwd(
 def f_joint_bwd(res: tuple[DynamicsParams, float], g: ReducedState):
     params, dt = res
     return (
-        g,
-        jnp.array(
-            [
-                dt * g[0] + dt / params.m * g[2],
-                dt * g[1] + dt / params.m * g[3],
-            ]
-        ),
-        None,
+        jnp.array([g[0], g[1], dt * g[0] + g[2], dt * g[1] + g[3]]),
+        dt / params.m * g[2:4],
+        -dt / params.m * g[2:4],
         None,
         None,
     )
