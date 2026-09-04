@@ -1,4 +1,5 @@
 from environments.base import (
+    EvaluationMetric,
     Policy,
     Rollout,
     batched_pytree_get_first,
@@ -6,6 +7,7 @@ from environments.base import (
 )
 
 __all__ = [
+    "EvaluationMetric",
     "Policy",
     "Rollout",
     "batched_pytree_get_first",

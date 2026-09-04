@@ -15,7 +15,7 @@ from environments import (
     batched_pytree_get_first,
     batched_pytree_prepend,
 )
-from environments import particle as env
+from environments import astrobee as env
 
 State = env.State
 Control = env.Control
@@ -200,9 +200,8 @@ class MLPPolicy(eqx.Module):
     """Policy on the observation (`env.get_observation` of the reduced state
     p(s)), plus the reference action.
 
-    The output is squashed through the Astrobee actuation limits; without a bound
-    the untrained policy drives ||omega|| high enough that the explicit Euler step
-    on the Euler equations diverges mid-rollout.
+    The output is squashed through the environment's actuation limits. Bounding
+    an untrained policy also keeps its initial rollouts numerically well behaved.
     """
 
     mlp: eqx.nn.MLP
@@ -239,24 +238,8 @@ def main():
     key = jax.random.key(0)
     init_key, train_key, eval_key = jax.random.split(key, 3)
 
-    # dynamics_params = env.default_dynamics_params()
-    # env_params = env.EnvParams(
-    #     cost_coeffs=env.CostCoeffs(c_r=1.0, a_r=5.0, c_R=1.0, c_xi=0.5, c_u=0.1),
-    #     sigma_torque=0.03,
-    #     sigma_force=0.3,
-    #     pos_std=0.5,
-    #     att_std=0.3,
-    #     vel_std=0.1,
-    #     omega_std=0.1,
-    # )
-
-    dynamics_params = env.DynamicsParams(m=1.0)
-    env_params = env.EnvParams(
-        cost_coeffs=env.CostCoeffs(c_r=1.0, a_r=5.0, c_v=0.5, c_u=0.1),
-        sigma=2.0,
-        pos_std=1.0,
-        vel_std=0.5,
-    )
+    dynamics_params = env.default_dynamics_params()
+    env_params = env.default_env_params()
 
     dt = 0.05
     train_params = TrainingParams(
@@ -293,30 +276,27 @@ def main():
         train_params,
     )
     out = evaluate(trained, eval_key, dynamics_params, dt, env_params, T=train_params.T)
-    pos_err = env.tracking_error(out)
-    # TODO: make this easy to switch
-    # att_err = env.attitude_error(out)
-    print(
-        f"eval: initial pos error = {pos_err[0]:.3f} m, final = {pos_err[-1]:.3f} m, "
-        f"mean = {pos_err.mean():.3f} m"
-    )
-    # print(
-    #     f"eval: initial att error = {att_err[0]:.3f} rad, final = {att_err[-1]:.3f} rad, "
-    #     f"mean = {att_err.mean():.3f} rad"
-    # )
+    for metric in env.evaluation_metrics(out):
+        unit = f" {metric.unit}" if metric.unit else ""
+        print(
+            f"eval: initial {metric.name} = {metric.values[0]:.3f}{unit}, "
+            f"final = {metric.values[-1]:.3f}{unit}, "
+            f"mean = {metric.values.mean():.3f}{unit}"
+        )
 
-    # TODO: fix discrepancies here
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(losses, color="tab:gray", lw=1)
     ax.set_xlabel("training iteration")
     ax.set_ylabel("mean tracking cost")
-    ax.set_title("particle policy-gradient training")
+    ax.set_title(f"{env.ENV_NAME} policy-gradient training")
     fig.tight_layout()
-    fig.savefig("training_curve_particle.png", dpi=120)
-    print("saved plot to training_curve_particle.png")
+    training_curve_path = f"training_curve_{env.ENV_NAME}.png"
+    fig.savefig(training_curve_path, dpi=120)
+    print(f"saved plot to {training_curve_path}")
 
+    trajectory_path = f"trajectory_{env.ENV_NAME}.gif"
     env.save_trajectory_gif(
-        out, dt, "trajectory_particle.gif", title="particle tracking (reduced)"
+        out, dt, trajectory_path, title=f"{env.ENV_NAME} tracking (reduced)"
     )
 
 

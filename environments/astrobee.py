@@ -34,7 +34,10 @@ import matplotlib.pyplot as plt
 from jaxtyping import Float
 from matplotlib import animation
 
-from environments.base import Rollout
+from environments.base import EvaluationMetric, Rollout
+
+
+ENV_NAME = "astrobee"
 
 
 @jax.tree_util.register_dataclass
@@ -104,6 +107,18 @@ class EnvParams:
     att_std: float  # std of the initial rotation vector, in radians
     vel_std: float
     omega_std: float
+
+
+def default_env_params() -> EnvParams:
+    return EnvParams(
+        cost_coeffs=CostCoeffs(c_r=1.0, a_r=5.0, c_R=1.0, c_xi=0.5, c_u=0.1),
+        sigma_torque=0.03,
+        sigma_force=0.3,
+        pos_std=0.5,
+        att_std=0.3,
+        vel_std=0.1,
+        omega_std=0.1,
+    )
 
 
 Twist = Float[jax.Array, "6"]
@@ -531,6 +546,13 @@ def tracking_error(out: Rollout[State, Control]) -> Float[jax.Array, " steps+1"]
 def attitude_error(out: Rollout[State, Control]) -> Float[jax.Array, " steps+1"]:
     """Per-step attitude tracking error ||log(R^T R^d)||, for reporting."""
     return jax.vmap(_pose_error)(out.s, out.s_ref)[1]
+
+
+def evaluation_metrics(out: Rollout[State, Control]) -> tuple[EvaluationMetric, ...]:
+    return (
+        EvaluationMetric("position error", tracking_error(out), "m"),
+        EvaluationMetric("attitude error", attitude_error(out), "rad"),
+    )
 
 
 # --- visualization ---------------------------------------------------------

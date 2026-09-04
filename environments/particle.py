@@ -14,7 +14,10 @@ import matplotlib.pyplot as plt
 from jaxtyping import Float
 from matplotlib import animation
 
-from environments.base import Rollout
+from environments.base import EvaluationMetric, Rollout
+
+
+ENV_NAME = "particle"
 
 
 @jax.tree_util.register_dataclass
@@ -63,6 +66,19 @@ class EnvParams:
     sigma: float
     pos_std: float
     vel_std: float
+
+
+def default_dynamics_params() -> DynamicsParams:
+    return DynamicsParams(m=1.0)
+
+
+def default_env_params() -> EnvParams:
+    return EnvParams(
+        cost_coeffs=CostCoeffs(c_r=1.0, a_r=5.0, c_v=0.5, c_u=0.1),
+        sigma=2.0,
+        pos_std=1.0,
+        vel_std=0.5,
+    )
 
 
 def control_limits() -> Control:
@@ -183,9 +199,13 @@ def cost(out: Rollout[State, Control], params: EnvParams) -> Float[jax.Array, ""
     return jnp.mean(alpha + coeffs.c_v * v_err + coeffs.c_u * u_err)
 
 
-def tracking_error(out: Rollout[State, Control]) -> Float[jax.Array, " steps"]:
+def tracking_error(out: Rollout[State, Control]) -> Float[jax.Array, " steps+1"]:
     """Per-step position tracking error, for reporting."""
     return jnp.linalg.norm(out.s.r - out.s_ref.r, axis=1)
+
+
+def evaluation_metrics(out: Rollout[State, Control]) -> tuple[EvaluationMetric, ...]:
+    return (EvaluationMetric("position error", tracking_error(out), "m"),)
 
 
 def save_trajectory_gif(
