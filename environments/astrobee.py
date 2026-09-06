@@ -428,9 +428,26 @@ def _compose_vjp(
     return (q_bar_A, t_bar_A), (q_bar_B, t_bar_B)
 
 
-def _exp_vjp(
-    A: jaxlie.SE3, q_bar: Quaternion, t_bar: Float[jax.Array, "3"]
-) -> Twist:
+def _compose_left_vjp(
+    A: jaxlie.SE3,
+    B: jaxlie.SE3,
+    q_bar: Quaternion,
+    t_bar: Float[jax.Array, "3"],
+) -> tuple[Quaternion, Float[jax.Array, "3"]]:
+    """VJP of C = A B with respect to A only.
+
+    Keeping this separate from `_compose_vjp` matters when B is the reference
+    trajectory: its cotangent is deliberately not propagated during BPTT, so
+    computing the right-factor pullback would be wasted work.
+    """
+    q_A = A.rotation().wxyz
+    q_bar_A = _quat_mul(q_bar, _quat_conj(B.rotation().wxyz)) - 2.0 * _quat_mul(
+        _quat_mul(_pure(t_bar), q_A), _pure(B.translation())
+    )
+    return q_bar_A, t_bar
+
+
+def _exp_vjp(A: jaxlie.SE3, q_bar: Quaternion, t_bar: Float[jax.Array, "3"]) -> Twist:
     """Pull an ambient cotangent on A = exp(d) back to a cotangent on d in R^6.
 
     Factors as d_bar = J_r(d)^T M(A)^T A_bar, where M(A) maps a body-frame
@@ -468,12 +485,13 @@ def f_q_joint_bwd(dt: float, res: ReducedState, g: Float[jax.Array, "7"]):
     Z = _unflatten_pose(reduced[:POSE_DIM])
     P = A_1 @ Z
 
-    (q_bar_P, t_bar_P), (q_bar_A2, t_bar_A2) = _compose_vjp(P, A_2, q_bar_F, t_bar_F)
+    q_bar_P, t_bar_P = _compose_left_vjp(P, A_2, q_bar_F, t_bar_F)
     (q_bar_A1, t_bar_A1), (q_bar_Z, t_bar_Z) = _compose_vjp(A_1, Z, q_bar_P, t_bar_P)
 
-    # d_1 = -xi dt and d_2 = xi^d dt, so the chain rule ends in a scaling.
+    # d_1 = -xi dt, so the chain rule ends in a scaling. The xi_ref cotangent
+    # is not needed by BPTT: the reference trajectory is exogenous.
     xi_bar = -dt * _exp_vjp(A_1, q_bar_A1, t_bar_A1)
-    xi_ref_bar = dt * _exp_vjp(A_2, q_bar_A2, t_bar_A2)
+    xi_ref_bar = jnp.full((TWIST_DIM,), jnp.inf)
 
     return (jnp.concatenate([q_bar_Z, t_bar_Z, xi_bar, xi_ref_bar]),)
 

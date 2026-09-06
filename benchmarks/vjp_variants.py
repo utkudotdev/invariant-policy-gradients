@@ -25,10 +25,10 @@ import statistics
 import time
 from functools import partial
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 import jaxlie
+import matplotlib.pyplot as plt
 from jaxtyping import Float
 
 from environments import astrobee as env
@@ -65,26 +65,26 @@ def rematerialized(f):
 # `fwd` linearizes the folded form and hands the resulting closure to `bwd` as
 # the residual (a `jax.vjp` closure is a registered pytree, so this is legal).
 # The forward that runs under differentiation is therefore the folded one, and
-# the backward applies a stored linearization rather than rebuilding it. The
+# the backward applies the stored autodiff pullback rather than rebuilding it. The
 # unfolded body below runs only when the function is *not* differentiated --
 # `rollout_eval`, say -- so it stays the readable definition of record.
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
-def folded_linearization(reduced: env.ReducedState, dt: float) -> jnp.ndarray:
+def folded_autodiff_vjp(reduced: env.ReducedState, dt: float) -> jnp.ndarray:
     return natural(reduced, dt)
 
 
-def _folded_linearization_fwd(reduced, dt):
+def _folded_autodiff_vjp_fwd(reduced, dt):
     out, vjp_fn = jax.vjp(lambda r: folded(r, dt), reduced)
     return out, vjp_fn
 
 
-def _folded_linearization_bwd(dt, vjp_fn, g):
+def _folded_autodiff_vjp_bwd(dt, vjp_fn, g):
     return vjp_fn(g)
 
 
-folded_linearization.defvjp(_folded_linearization_fwd, _folded_linearization_bwd)
+folded_autodiff_vjp.defvjp(_folded_autodiff_vjp_fwd, _folded_autodiff_vjp_bwd)
 
 
 # --- variant: the analytic VJP, copied from environments/astrobee.py --------
@@ -157,6 +157,20 @@ def _compose_vjp(
     return (q_bar_A, t_bar_A), (q_bar_B, t_bar_B)
 
 
+def _compose_left_vjp(
+    A: jaxlie.SE3,
+    B: jaxlie.SE3,
+    q_bar: Quaternion,
+    t_bar: Float[jax.Array, "3"],
+) -> tuple[Quaternion, Float[jax.Array, "3"]]:
+    """VJP of C = A B with respect to A only."""
+    q_A = A.rotation().wxyz
+    q_bar_A = _quat_mul(q_bar, _quat_conj(B.rotation().wxyz)) - 2.0 * _quat_mul(
+        _quat_mul(_pure(t_bar), q_A), _pure(B.translation())
+    )
+    return q_bar_A, t_bar
+
+
 def _exp_vjp(
     A: jaxlie.SE3, q_bar: Quaternion, t_bar: Float[jax.Array, "3"]
 ) -> env.Twist:
@@ -194,12 +208,11 @@ def _analytic_bwd(dt: float, res: env.ReducedState, g: Float[jax.Array, "7"]):
     Z = env._unflatten_pose(reduced[: env.POSE_DIM])
     P = A_1 @ Z
 
-    (q_bar_P, t_bar_P), (q_bar_A2, t_bar_A2) = _compose_vjp(P, A_2, q_bar_F, t_bar_F)
+    q_bar_P, t_bar_P = _compose_left_vjp(P, A_2, q_bar_F, t_bar_F)
     (q_bar_A1, t_bar_A1), (q_bar_Z, t_bar_Z) = _compose_vjp(A_1, Z, q_bar_P, t_bar_P)
 
-    # d_1 = -xi dt and d_2 = xi^d dt, so the chain rule ends in a scaling.
     xi_bar = -dt * _exp_vjp(A_1, q_bar_A1, t_bar_A1)
-    xi_ref_bar = dt * _exp_vjp(A_2, q_bar_A2, t_bar_A2)
+    xi_ref_bar = jnp.full((env.TWIST_DIM,), jnp.inf)
 
     return (jnp.concatenate([q_bar_Z, t_bar_Z, xi_bar, xi_ref_bar]),)
 
@@ -240,37 +253,12 @@ def _stored_bwd(dt, A_1, A_2, Z, Q, g):
     """The same rule as `_analytic_bwd`, re-associated as F = A_1 Q, Q = Z A_2."""
     q_bar_F, t_bar_F = g[:4], g[4:]
     (q_bar_A1, t_bar_A1), (q_bar_Q, t_bar_Q) = _compose_vjp(A_1, Q, q_bar_F, t_bar_F)
-    (q_bar_Z, t_bar_Z), (q_bar_A2, t_bar_A2) = _compose_vjp(Z, A_2, q_bar_Q, t_bar_Q)
+    q_bar_Z, t_bar_Z = _compose_left_vjp(Z, A_2, q_bar_Q, t_bar_Q)
 
     xi_bar = -dt * _exp_vjp(A_1, q_bar_A1, t_bar_A1)
-    xi_ref_bar = dt * _exp_vjp(A_2, q_bar_A2, t_bar_A2)
+    xi_ref_bar = jnp.full((env.TWIST_DIM,), jnp.inf)
 
     return (jnp.concatenate([q_bar_Z, t_bar_Z, xi_bar, xi_ref_bar]),)
-
-
-@partial(jax.custom_vjp, nondiff_argnums=(1,))
-def analytic_derived(reduced: env.ReducedState, dt: float) -> jnp.ndarray:
-    """Derived forward *and* derived backward, with the factors carried across.
-
-    The only difference from `analytic_stored` is that the primal body is the
-    derived expression rather than `natural`. Under differentiation that body
-    never runs -- `fwd` does -- so the two measure the same thing; this one is
-    simply honest about what the function is.
-    """
-    return derived(reduced, dt)
-
-
-def _analytic_derived_fwd(reduced, dt):
-    out, (A_1, A_2, Z, _) = _factors(reduced, dt)
-    return out, (A_1, A_2, Z)
-
-
-def _analytic_derived_bwd(dt, res, g):
-    A_1, A_2, Z = res
-    return _stored_bwd(dt, A_1, A_2, Z, Z @ A_2, g)
-
-
-analytic_derived.defvjp(_analytic_derived_fwd, _analytic_derived_bwd)
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
@@ -310,28 +298,28 @@ def _analytic_stored_all_bwd(dt, res, g):
 analytic_stored_all.defvjp(_analytic_stored_all_fwd, _analytic_stored_all_bwd)
 
 
-# --- variant: natural definition, derived form linearized -------------------
+# --- variant: natural definition, autodiff VJP of the derived form ----------
 #
-# As `folded_linearization`, but linearizing `derived` -- so the forward that
-# runs under differentiation also drops the SE(3) inverse, not just the identity
-# compose.
+# As `folded_autodiff_vjp`, but `jax.vjp` differentiates `derived` -- so the
+# forward that runs under differentiation also drops the SE(3) inverse, not just
+# the identity compose.
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(1,))
-def derived_linearization(reduced: env.ReducedState, dt: float) -> jnp.ndarray:
+def derived_autodiff_vjp(reduced: env.ReducedState, dt: float) -> jnp.ndarray:
     return natural(reduced, dt)
 
 
-def _derived_linearization_fwd(reduced, dt):
+def _derived_autodiff_vjp_fwd(reduced, dt):
     out, vjp_fn = jax.vjp(lambda r: derived(r, dt), reduced)
     return out, vjp_fn
 
 
-def _derived_linearization_bwd(dt, vjp_fn, g):
+def _derived_autodiff_vjp_bwd(dt, vjp_fn, g):
     return vjp_fn(g)
 
 
-derived_linearization.defvjp(_derived_linearization_fwd, _derived_linearization_bwd)
+derived_autodiff_vjp.defvjp(_derived_autodiff_vjp_fwd, _derived_autodiff_vjp_bwd)
 
 
 VARIANTS = [
@@ -339,14 +327,13 @@ VARIANTS = [
     ("autodiff, q=I folded", folded),
     ("natural + checkpoint", rematerialized(natural)),
     ("q=I folded + checkpoint", rematerialized(folded)),
-    ("folded linearization", folded_linearization),
-    ("derived linearization", derived_linearization),
+    ("custom VJP (autodiff), folded", folded_autodiff_vjp),
+    ("custom VJP (autodiff), derived", derived_autodiff_vjp),
     ("analytic VJP", analytic),
     ("analytic, store factors", analytic_stored),
     ("analytic, store all", analytic_stored_all),
     ("autodiff, derived", derived),
     ("derived + checkpoint", rematerialized(derived)),
-    ("analytic, derived fwd", analytic_derived),
 ]
 
 
@@ -356,6 +343,8 @@ BATCH = 2048
 T_TIMED = 200
 POSE_WEIGHTS = jnp.array([1.0, 2.0, -1.0, 0.5, 3.0, -2.0, 1.0])
 DT = 0.05
+PLOT_PATH = "vjp_variants.png"
+NAME_WIDTH = 31
 
 PROBE = jnp.array(
     [1.0, 0.0, 0.0, 0.0, 0.3, -0.2, 0.5,
@@ -402,6 +391,34 @@ def time_ms(fn, reps: int = 50) -> tuple[float, float]:
     return min(samples), statistics.median(samples)
 
 
+def save_plot(results: list[tuple[str, float, float]]) -> None:
+    """Plot per-step temporary storage against median runtime."""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    colors = plt.get_cmap("tab20").colors
+    markers = ("o", "s", "^", "D", "v", "P", "X", "<", ">", "p", "h", "*")
+
+    for i, (name, floats_per_step, median_ms) in enumerate(results):
+        ax.scatter(
+            floats_per_step,
+            median_ms,
+            s=75,
+            color=colors[i % len(colors)],
+            marker=markers[i % len(markers)],
+            label=name,
+            zorder=3,
+        )
+
+    ax.set_xlabel("Temporary storage (floats/step/example)")
+    ax.set_ylabel("Median runtime (ms)")
+    ax.set_title(f"Pose-step VJP tradeoff (T={T_TIMED}, batch={BATCH})")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5), frameon=False)
+    fig.tight_layout()
+    fig.savefig(PLOT_PATH, dpi=160)
+    plt.close(fig)
+    print(f"\nsaved plot to {PLOT_PATH}")
+
+
 def main():
     print(f"backend: {jax.default_backend()}  {jax.devices()}")
     print(f"T={T_TIMED}, batch={BATCH}, float32, pose step only\n")
@@ -410,23 +427,30 @@ def main():
     for name, fn in VARIANTS:
         g = jax.grad(lambda r: jnp.sum(POSE_WEIGHTS * fn(r, DT)))(PROBE)
         reference = g if reference is None else reference
+        # BPTT only needs the pose and primary-twist cotangents. The analytic
+        # variants intentionally leave the exogenous reference-twist block Inf.
         print(
-            f"  {name:<26} max |grad - reference| = "
-            f"{float(jnp.max(jnp.abs(g - reference))):.2e}"
+            f"  {name:<{NAME_WIDTH}} max |relevant grad - reference| = "
+            f"{float(jnp.max(jnp.abs(g[:13] - reference[:13]))):.2e}"
         )
     # The analytic rule associates the products differently, so in float32 it
     # lands ~2e-6 from the autodiff variants. In float64 the two agree to 1e-13.
 
     print(
-        f"\n{'variant':<26}{'temp bytes':>10}{'floats/step':>13}{'min ms':>9}{'median ms':>11}"
+        f"\n{'variant':<{NAME_WIDTH}}{'temp bytes':>10}{'floats/step':>13}"
+        f"{'min ms':>9}{'median ms':>11}"
     )
+    results = []
     for name, variant in VARIANTS:
         fn = grad_fn(variant)
         # slope over T isolates the per-step residual from fixed overhead
         slope = (temp_bytes(fn, 400) - temp_bytes(fn, 100)) / 300 / BATCH / 4
         b = temp_bytes(fn, T_TIMED)
         lo, med = time_ms(fn)
-        print(f"{name:<26}{b:>10}{slope:>13.1f}{lo:>9.2f}{med:>11.2f}")
+        print(f"{name:<{NAME_WIDTH}}{b:>10}{slope:>13.1f}{lo:>9.2f}{med:>11.2f}")
+        results.append((name, slope, med))
+
+    save_plot(results)
 
 
 if __name__ == "__main__":
