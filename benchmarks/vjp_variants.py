@@ -31,7 +31,7 @@ import jaxlie
 import matplotlib.pyplot as plt
 from jaxtyping import Float
 
-from environments import astrobee as env
+from environments import astrobee_reduced as env
 
 
 # --- the two ways of writing the same map ----------------------------------
@@ -87,7 +87,7 @@ def _folded_autodiff_vjp_bwd(dt, vjp_fn, g):
 folded_autodiff_vjp.defvjp(_folded_autodiff_vjp_fwd, _folded_autodiff_vjp_bwd)
 
 
-# --- variant: the analytic VJP, copied from environments/astrobee.py --------
+# --- variant: analytic VJP, copied from environments/astrobee_reduced.py ----
 #
 # Copied rather than imported so this benchmark measures a fixed implementation
 # even if the module's rule changes. See that file for the derivation; in short,
