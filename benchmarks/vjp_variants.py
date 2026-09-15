@@ -33,7 +33,6 @@ from jaxtyping import Float
 
 from environments import astrobee_reduced as env
 
-
 # --- the two ways of writing the same map ----------------------------------
 
 
@@ -87,7 +86,7 @@ def _folded_autodiff_vjp_bwd(dt, vjp_fn, g):
 folded_autodiff_vjp.defvjp(_folded_autodiff_vjp_fwd, _folded_autodiff_vjp_bwd)
 
 
-# --- variant: analytic VJP, copied from environments/astrobee_reduced.py ----
+# --- analytic VJP, copied from environments/astrobee_reduced_analytic.py ----
 #
 # Copied rather than imported so this benchmark measures a fixed implementation
 # even if the module's rule changes. See that file for the derivation; in short,
@@ -425,7 +424,7 @@ def main():
 
     reference = None
     for name, fn in VARIANTS:
-        g = jax.grad(lambda r: jnp.sum(POSE_WEIGHTS * fn(r, DT)))(PROBE)
+        g = jax.grad(lambda r, fn=fn: jnp.sum(POSE_WEIGHTS * fn(r, DT)))(PROBE)
         reference = g if reference is None else reference
         # BPTT only needs the pose and primary-twist cotangents. The analytic
         # variants intentionally leave the exogenous reference-twist block Inf.
